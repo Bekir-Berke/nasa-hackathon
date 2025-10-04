@@ -63,6 +63,7 @@
     .list-item{ display:flex; align-items:center; gap:8px; margin:5px 0; font-size:13px; color:#e2e8f0;}
     .dot{ width:10px; height:10px; border-radius:50%; }
     .active{ background:#22c55e; } .danger{ background:#ef4444; } .rest{ background:#9ca3af; } .drone{ background:#38bdf8; }
+    .slider{ width:100%; accent-color:#facc15; }
 
     /* === TOOLTIP === */
     .ol-tooltip {
@@ -135,6 +136,8 @@
   <div class="section">
     <h3>🧪 Simülasyon</h3>
     <div class="info-line"><span>Durum:</span><span id="sim-status">Hazır</span></div>
+    <div class="info-line"><span>Saat:</span><span id="sim-hour">0</span></div>
+    <input type="range" id="sim-slider" class="slider" min="0" max="0" value="0" step="1" disabled>
   </div>
   <div class="section">
     <h3>👨‍🚒 İtfaiyeciler</h3>
@@ -156,12 +159,17 @@ const socket = io(API_URL, { transports: ["websocket"] });
 let currentFireArea = [];
 let environmentData = null;
 let lastEnvironmentFetch = 0;
-let forecastAnimationHandle = null;
 let forecastGroups = [];
-let forecastIndex = 0;
 let simInProgress = false;
 let windDeg = 0;
 let windSpeed = 2.5;
+
+const sliderEl = document.getElementById("sim-slider");
+const sliderLabelEl = document.getElementById("sim-hour");
+resetForecastSlider();
+sliderEl.addEventListener("input", (event) => {
+  renderForecast(event.target.value);
+});
 
 const clockEl = document.getElementById("clock");
 setInterval(() => {
@@ -236,6 +244,80 @@ let pulsePhase = 0;
 
 function setSimStatus(text) {
   document.getElementById("sim-status").innerText = text;
+}
+
+function resetForecastSlider() {
+  sliderEl.disabled = true;
+  sliderEl.min = 0;
+  sliderEl.max = 0;
+  sliderEl.value = 0;
+  sliderLabelEl.innerText = "0";
+}
+
+function clearForecast() {
+  forecastSource.clear();
+  forecastGroups = [];
+  resetForecastSlider();
+}
+
+function renderForecast(targetHour) {
+  if (!forecastGroups.length) {
+    sliderLabelEl.innerText = "0";
+    setSimStatus("Hazır");
+    forecastSource.clear();
+    return;
+  }
+
+  const maxHour = forecastGroups.length - 1;
+  const hour = Math.max(0, Math.min(maxHour, Number(targetHour) || 0));
+  sliderEl.value = hour;
+  sliderLabelEl.innerText = String(hour);
+  setSimStatus(`Saat +${hour}`);
+
+  forecastSource.clear();
+  for (let h = 0; h <= hour; h++) {
+    const group = forecastGroups[h] || [];
+    group.forEach((cell) => {
+      const projected = cell.coords.map(([lon, lat]) => ol.proj.fromLonLat([lon, lat]));
+      const poly = new geom.Polygon([projected]);
+      const feature = new Feature(poly);
+      const isOrigin = h === 0;
+      const fillColor = isOrigin ? "rgba(220,0,0,0.5)" : "rgba(255,215,0,0.3)";
+      const strokeColor = isOrigin ? "rgba(200,40,40,0.9)" : "rgba(255,200,0,0.7)";
+      feature.setStyle(new style.Style({
+        fill: new style.Fill({ color: fillColor }),
+        stroke: new style.Stroke({ color: strokeColor, width: isOrigin ? 2 : 1.2 })
+      }));
+      forecastSource.addFeature(feature);
+    });
+  }
+}
+
+function prepareForecast(rawFeatures) {
+  clearForecast();
+  if (!Array.isArray(rawFeatures) || !rawFeatures.length) {
+    setSimStatus("Tahmin verisi yok");
+    return;
+  }
+
+  rawFeatures.sort((a, b) => (a.properties?.hour ?? 0) - (b.properties?.hour ?? 0));
+  const grouped = [];
+  rawFeatures.forEach((feature) => {
+    const hour = feature.properties?.hour ?? 0;
+    if (!grouped[hour]) grouped[hour] = [];
+    grouped[hour].push({
+      coords: feature.geometry.coordinates[0],
+      probability: feature.properties?.probability ?? 0
+    });
+  });
+  forecastGroups = grouped.filter(Boolean);
+
+  sliderEl.disabled = false;
+  sliderEl.min = 0;
+  sliderEl.max = forecastGroups.length - 1;
+  sliderEl.value = 0;
+  sliderLabelEl.innerText = "0";
+  renderForecast(0);
 }
 
 function computeCentroid(coords) {
@@ -382,68 +464,6 @@ function animateWindArrows() {
   requestAnimationFrame(animateWindArrows);
 }
 
-function forecastFill(step, total) {
-  const ratio = total <= 1 ? 1 : step / (total - 1);
-  const r = 255;
-  const g = Math.round(210 - 120 * ratio);
-  const b = Math.round(90 - 60 * ratio);
-  const alpha = 0.18 + 0.25 * ratio;
-  return { fill: `rgba(${r},${g},${b},${alpha})`, stroke: `rgba(255,86,48,${0.45 + 0.35 * ratio})` };
-}
-
-function clearForecast() {
-  forecastSource.clear();
-  forecastGroups = [];
-  forecastIndex = 0;
-  if (forecastAnimationHandle) {
-    clearTimeout(forecastAnimationHandle);
-    forecastAnimationHandle = null;
-  }
-}
-
-function animateForecast(rawFeatures) {
-  clearForecast();
-  if (!Array.isArray(rawFeatures) || !rawFeatures.length) {
-    setSimStatus("Tahmin verisi yok");
-    return;
-  }
-  rawFeatures.sort((a, b) => (a.properties?.hour ?? 0) - (b.properties?.hour ?? 0));
-  const grouped = [];
-  rawFeatures.forEach((feature) => {
-    const hour = feature.properties?.hour ?? 0;
-    if (!grouped[hour]) grouped[hour] = [];
-    grouped[hour].push(feature);
-  });
-  forecastGroups = grouped.filter(Boolean);
-  setSimStatus("Simülasyon oynatılıyor...");
-  const total = forecastGroups.length;
-
-  function step() {
-    if (forecastIndex >= forecastGroups.length) {
-      setSimStatus("Tamamlandı");
-      forecastAnimationHandle = null;
-      return;
-    }
-    const group = forecastGroups[forecastIndex];
-    const colors = forecastFill(forecastIndex, total);
-    group.forEach((feature) => {
-      const polygon = feature.geometry.coordinates[0].map(([lon, lat]) => ol.proj.fromLonLat([lon, lat]));
-      const poly = new geom.Polygon([polygon]);
-      const ft = new Feature(poly);
-      ft.setStyle(new style.Style({
-        fill: new style.Fill({ color: colors.fill }),
-        stroke: new style.Stroke({ color: colors.stroke, width: 1 })
-      }));
-      forecastSource.addFeature(ft);
-    });
-    setSimStatus(`Saat +${forecastIndex} (${forecastSource.getFeatures().length} hücre)`);
-    forecastIndex += 1;
-    forecastAnimationHandle = setTimeout(step, 900);
-  }
-
-  step();
-}
-
 async function runSimulation() {
   if (simInProgress) return;
   if (!currentFireArea.length) {
@@ -463,7 +483,7 @@ async function runSimulation() {
     if (!res.ok) throw new Error(`simulation failed ${res.status}`);
     const data = await res.json();
     updateEnvironmentPanel(data);
-    animateForecast(data.features);
+    prepareForecast(data.features);
   } catch (err) {
     console.error(err);
     setSimStatus("Simülasyon başarısız");
@@ -496,7 +516,7 @@ socket.on("firearea:update", (coords) => {
 });
 socket.on("drones:init", drawDrones);
 socket.on("drones:update", drawDrones);
-socket.on("fire:forecast", animateForecast);
+socket.on("fire:forecast", prepareForecast);
 
 loadAll();
 animateWindArrows();
