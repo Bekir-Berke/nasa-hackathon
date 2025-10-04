@@ -124,14 +124,16 @@ app.post("/api/fire/simulation", async (req, res) => {
       hours: typeof hours === "number" ? hours : undefined,
       gridSize: typeof gridSize === "number" ? gridSize : undefined,
       cellSize: typeof cellSize === "number" ? cellSize : undefined,
-      seed: typeof seed === "number" ? seed : undefined
+      seed: typeof seed === "number" ? seed : undefined,
+      basePolygon: Array.isArray(fireArea)
+        ? fireArea
+            .filter((coord) => Array.isArray(coord) && coord.length >= 2)
+            .map(([latValue, lonValue]) => [Number(latValue), Number(lonValue)])
+        : undefined
     });
 
-    if (simulation.footprint.length >= 3) {
-      setFireArea(simulation.footprint);
-      io.emit("firearea:update", fireArea);
-    }
-    io.emit("fire:forecast", simulation.features);
+    // Don't overwrite the initial fireArea - it should remain fixed
+    io.emit("fire:forecast", simulation.forecast);
     res.json(simulation);
   } catch (err) {
     console.error("simulation failed", err);

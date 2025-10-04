@@ -98,6 +98,86 @@
     }
     body.light .btn { background:rgba(0,0,0,0.05); color:#111827; border-color:rgba(0,0,0,0.1);}
     body.light .btn:hover { background:rgba(0,0,0,0.1); }
+
+    /* === NOTIFICATIONS === */
+    .notifications-container {
+      position: absolute;
+      top: 70px;
+      left: 20px;
+      width: 350px;
+      max-height: 400px;
+      overflow-y: auto;
+      z-index: 950;
+      pointer-events: none;
+    }
+    .notification {
+      background: rgba(239, 68, 68, 0.95);
+      backdrop-filter: blur(10px);
+      border-radius: 12px;
+      padding: 14px 16px;
+      margin-bottom: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+      animation: slideIn 0.3s ease-out;
+      pointer-events: auto;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .notification:hover {
+      background: rgba(239, 68, 68, 1);
+      transform: translateX(5px);
+    }
+    .notification.warning {
+      background: rgba(251, 146, 60, 0.95);
+    }
+    .notification.warning:hover {
+      background: rgba(251, 146, 60, 1);
+    }
+    .notification.info {
+      background: rgba(59, 130, 246, 0.95);
+    }
+    .notification.info:hover {
+      background: rgba(59, 130, 246, 1);
+    }
+    .notification-title {
+      font-weight: 600;
+      font-size: 13px;
+      color: #fff;
+      margin-bottom: 4px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .notification-icon {
+      font-size: 16px;
+    }
+    .notification-body {
+      font-size: 12px;
+      color: #fee;
+      line-height: 1.4;
+      white-space: pre-line;
+    }
+    .notification-time {
+      font-size: 10px;
+      color: rgba(255, 255, 255, 0.7);
+      margin-top: 6px;
+    }
+    @keyframes slideIn {
+      from {
+        opacity: 0;
+        transform: translateX(-20px);
+      }
+      to {
+        opacity: 1;
+        transform: translateX(0);
+      }
+    }
+    body.light .notification {
+      color: #0f172a;
+    }
+    body.light .notification-body {
+      color: rgba(15, 23, 42, 0.8);
+    }
   </style>
 </head>
 <body>
@@ -119,6 +199,9 @@
     <div class="clock" id="clock">--:--:--</div>
   </div>
 </div>
+
+<!-- === NOTIFICATIONS === -->
+<div class="notifications-container" id="notifications"></div>
 
 <!-- === SAĞ PANEL === -->
 <div class="panel">
@@ -153,7 +236,7 @@
 
 <script>
 const { Map, View, layer, source, geom, Feature, style } = ol;
-const API_URL = "http://localhost:5000";
+const API_URL = "http://localhost:5001";
 const socket = io(API_URL, { transports: ["websocket"] });
 
 let currentFireArea = [];
@@ -163,6 +246,228 @@ let forecastGroups = [];
 let simInProgress = false;
 let windDeg = 0;
 let windSpeed = 2.5;
+let notificationQueue = [];
+let notificationInterval = null;
+let locationName = "Denizli, Türkiye";
+let dangerMarkerSource = null;
+let dangerMarkerLayer = null;
+
+// Fixed alert location: 37°41'24.6"N 29°05'04.9"E
+function getAlertLocation(baseLat, baseLon) {
+  return {
+    lat: 37.690183,
+    lon: 29.084694
+  };
+}
+
+// Notification System
+function showNotification(title, message, type = 'danger', icon = '⚠️', location = null) {
+  const container = document.getElementById("notifications");
+  const notification = document.createElement("div");
+  notification.className = `notification ${type}`;
+
+  const now = new Date().toLocaleTimeString("tr-TR", { hour12: false });
+
+  notification.innerHTML = `
+    <div class="notification-title">
+      <span class="notification-icon">${icon}</span>
+      <span>${title}</span>
+    </div>
+    <div class="notification-body">${message}</div>
+    <div class="notification-time">${now}</div>
+  `;
+
+  // Click to navigate to location
+  notification.addEventListener("click", () => {
+    if (location && location.lat && location.lon) {
+      // Pan and zoom to location
+      const view = map.getView();
+      view.animate({
+        center: ol.proj.fromLonLat([location.lon, location.lat]),
+        zoom: 14,
+        duration: 1000
+      });
+
+      // Show blinking danger marker
+      showDangerMarker(location.lat, location.lon);
+    }
+
+    // Dismiss notification
+    notification.style.opacity = "0";
+    notification.style.transform = "translateX(-30px)";
+    setTimeout(() => notification.remove(), 300);
+  });
+
+  container.insertBefore(notification, container.firstChild);
+
+  // Auto-dismiss after 8 seconds
+  setTimeout(() => {
+    if (notification.parentElement) {
+      notification.style.opacity = "0";
+      notification.style.transform = "translateX(-30px)";
+      setTimeout(() => notification.remove(), 300);
+    }
+  }, 8000);
+}
+
+let dangerBlinkInterval = null;
+
+function showDangerMarker(lat, lon) {
+  // Remove existing danger marker layer if any
+  if (dangerMarkerLayer) {
+    if (dangerBlinkInterval) {
+      clearInterval(dangerBlinkInterval);
+    }
+    map.removeLayer(dangerMarkerLayer);
+  }
+
+  // Create new marker source and layer
+  dangerMarkerSource = new source.Vector();
+  dangerMarkerLayer = new layer.Vector({ source: dangerMarkerSource });
+  map.addLayer(dangerMarkerLayer);
+
+  const point = new geom.Point(ol.proj.fromLonLat([lon, lat]));
+  const feature = new Feature(point);
+
+  // Expanding, shrinking, and blinking dot animation
+  let radius = 12;
+  let opacity = 1;
+  let growing = true;
+  const minRadius = 8;
+  const maxRadius = 28;
+
+  const animate = () => {
+    // Expand and shrink
+    if (growing) {
+      radius += 0.5;
+      if (radius >= maxRadius) {
+        growing = false;
+      }
+    } else {
+      radius -= 0.5;
+      if (radius <= minRadius) {
+        growing = true;
+      }
+    }
+
+    // Blink effect - opacity oscillates
+    const progress = (radius - minRadius) / (maxRadius - minRadius);
+    opacity = 0.4 + Math.sin(progress * Math.PI) * 0.6; // Smooth blink 0.4 to 1.0
+
+    feature.setStyle(new style.Style({
+      image: new style.Circle({
+        radius: radius,
+        fill: new style.Fill({ color: `rgba(239, 68, 68, ${opacity * 0.5})` }),
+        stroke: new style.Stroke({
+          color: `rgba(220, 38, 38, ${opacity})`,
+          width: 3
+        })
+      })
+    }));
+
+    map.render();
+  };
+
+  dangerMarkerSource.addFeature(feature);
+
+  // Start expanding/shrinking/blinking animation - persist indefinitely
+  dangerBlinkInterval = setInterval(animate, 30);
+}
+
+function generateWeatherAnomalies(weatherData, location) {
+  const anomalies = [];
+
+  if (!weatherData || !weatherData.summary) return anomalies;
+
+  const summary = weatherData.summary;
+  const temp = summary.temperature_2m;
+  const wind = summary.wind_speed_10m;
+  const humidity = summary.relative_humidity_2m;
+
+  // Temperature anomaly (based on typical range)
+  if (temp > 35) {
+    const change = ((temp - 20) / 20 * 100).toFixed(1);
+    anomalies.push({
+      title: "Anormal Sıcaklık Tespit Edildi",
+      message: `Anormal sıcaklık değişimi tespit edildi +${change}%\n${locationName}`,
+      type: "danger",
+      icon: "🌡️",
+      location: location
+    });
+  }
+
+  // Wind speed anomaly
+  if (wind > 15) {
+    const change = ((wind - 5) / 5 * 100).toFixed(1);
+    anomalies.push({
+      title: "Yüksek Rüzgar Hızı Uyarısı",
+      message: `Rüzgar hızı +${change}% arttı\n${locationName}`,
+      type: "warning",
+      icon: "💨",
+      location: location
+    });
+  }
+
+  // Low humidity (fire risk)
+  if (humidity < 30) {
+    const change = ((50 - humidity) / 50 * 100).toFixed(1);
+    anomalies.push({
+      title: "Düşük Nem Uyarısı",
+      message: `Nem -${change}% düştü\n${locationName}'da yüksek yangın riski`,
+      type: "warning",
+      icon: "💧",
+      location: location
+    });
+  }
+
+  return anomalies;
+}
+
+function startPeriodicNotifications(weatherData, location) {
+  // Clear existing interval
+  if (notificationInterval) {
+    clearInterval(notificationInterval);
+  }
+
+  // Generate anomalies from weather data
+  const anomalies = generateWeatherAnomalies(weatherData, location);
+
+  if (anomalies.length === 0) {
+    // If no real anomalies, create a synthetic one for demo
+    anomalies.push({
+      title: "Anormal Sıcaklık Tespit Edildi",
+      message: `Anormal sıcaklık değişimi tespit edildi +82.5%\n${locationName}`,
+      type: "danger",
+      icon: "🌡️",
+      location: location
+    });
+  }
+
+  let notifIndex = 0;
+
+  // Show first notification immediately
+  if (anomalies.length > 0) {
+    const notif = anomalies[notifIndex];
+    showNotification(notif.title, notif.message, notif.type, notif.icon, notif.location);
+    notifIndex = (notifIndex + 1) % anomalies.length;
+  }
+
+  // Show notifications every 5 seconds during simulation
+  notificationInterval = setInterval(() => {
+    if (anomalies.length > 0) {
+      const notif = anomalies[notifIndex];
+      showNotification(notif.title, notif.message, notif.type, notif.icon, notif.location);
+      notifIndex = (notifIndex + 1) % anomalies.length;
+    }
+  }, 5000);
+}
+
+function stopPeriodicNotifications() {
+  if (notificationInterval) {
+    clearInterval(notificationInterval);
+    notificationInterval = null;
+  }
+}
 
 const sliderEl = document.getElementById("sim-slider");
 const sliderLabelEl = document.getElementById("sim-hour");
@@ -251,6 +556,7 @@ function resetForecastSlider() {
   sliderEl.min = 0;
   sliderEl.max = 0;
   sliderEl.value = 0;
+  sliderEl.step = 1;
   sliderLabelEl.innerText = "0";
 }
 
@@ -258,6 +564,7 @@ function clearForecast() {
   forecastSource.clear();
   forecastGroups = [];
   resetForecastSlider();
+  if (!simInProgress) setSimStatus("Hazır");
 }
 
 function renderForecast(targetHour) {
@@ -268,29 +575,55 @@ function renderForecast(targetHour) {
     return;
   }
 
-  const maxHour = forecastGroups.length - 1;
-  const hour = Math.max(0, Math.min(maxHour, Number(targetHour) || 0));
+  const sliderMin = Number(sliderEl.min);
+  const sliderMax = Number(sliderEl.max);
+  const hour = Math.max(sliderMin, Math.min(sliderMax, Number(targetHour) || sliderMin));
   sliderEl.value = hour;
   sliderLabelEl.innerText = String(hour);
   setSimStatus(`Saat +${hour}`);
 
   forecastSource.clear();
-  for (let h = 0; h <= hour; h++) {
-    const group = forecastGroups[h] || [];
-    group.forEach((cell) => {
-      const projected = cell.coords.map(([lon, lat]) => ol.proj.fromLonLat([lon, lat]));
-      const poly = new geom.Polygon([projected]);
-      const feature = new Feature(poly);
-      const isOrigin = h === 0;
-      const fillColor = isOrigin ? "rgba(220,0,0,0.5)" : "rgba(255,215,0,0.3)";
-      const strokeColor = isOrigin ? "rgba(200,40,40,0.9)" : "rgba(255,200,0,0.7)";
-      feature.setStyle(new style.Style({
-        fill: new style.Fill({ color: fillColor }),
-        stroke: new style.Stroke({ color: strokeColor, width: isOrigin ? 2 : 1.2 })
-      }));
-      forecastSource.addFeature(feature);
-    });
-  }
+
+  // Render each hour as a non-overlapping ring with unique color
+  forecastGroups.forEach((entry, idx) => {
+    if (!entry.coords || entry.hour > hour) return;
+
+    // Generate unique color for each hour
+    const maxHour = forecastGroups[forecastGroups.length - 1].hour;
+    const t = entry.hour / Math.max(1, maxHour); // 0 to 1
+    const r = 255;
+    const g = Math.round(80 + 175 * t); // 80 (red-orange) to 255 (yellow)
+    const b = Math.round(20 * (1 - t)); // 20 to 0
+
+    const isCurrentHour = entry.hour === hour;
+    const alpha = isCurrentHour ? 0.6 : 0.4;
+    const fillColor = `rgba(${r},${g},${b},${alpha})`;
+    const strokeColor = `rgba(${r},${Math.max(60, g - 40)},0,0.9)`;
+    const strokeWidth = isCurrentHour ? 2.5 : 1.8;
+
+    let poly;
+    // Create ring geometry (polygon with hole) for hours > 0
+    if (entry.previousPolygon && entry.isRing) {
+      const outerRing = entry.coords.map(([lon, lat]) => ol.proj.fromLonLat([lon, lat]));
+      const innerRing = entry.previousPolygon.map(([lon, lat]) => ol.proj.fromLonLat([lon, lat]));
+      // Reverse inner ring to create a hole
+      innerRing.reverse();
+      poly = new geom.Polygon([outerRing, innerRing]);
+    } else {
+      // Hour 0 or no previous polygon - render as solid polygon
+      const projected = entry.coords.map(([lon, lat]) => ol.proj.fromLonLat([lon, lat]));
+      poly = new geom.Polygon([projected]);
+    }
+
+    const feature = new Feature(poly);
+    feature.setStyle(new style.Style({
+      fill: new style.Fill({ color: fillColor }),
+      stroke: new style.Stroke({ color: strokeColor, width: strokeWidth })
+    }));
+    feature.set("label", `Saat +${entry.hour}`);
+    feature.set("zIndex", entry.hour); // Layer ordering
+    forecastSource.addFeature(feature);
+  });
 }
 
 function prepareForecast(rawFeatures) {
@@ -300,24 +633,30 @@ function prepareForecast(rawFeatures) {
     return;
   }
 
-  rawFeatures.sort((a, b) => (a.properties?.hour ?? 0) - (b.properties?.hour ?? 0));
-  const grouped = [];
-  rawFeatures.forEach((feature) => {
-    const hour = feature.properties?.hour ?? 0;
-    if (!grouped[hour]) grouped[hour] = [];
-    grouped[hour].push({
-      coords: feature.geometry.coordinates[0],
-      probability: feature.properties?.probability ?? 0
-    });
-  });
-  forecastGroups = grouped.filter(Boolean);
+  const filtered = rawFeatures
+    .filter((entry) => entry && Array.isArray(entry.coordinates) && entry.coordinates.length > 2)
+    .sort((a, b) => a.hour - b.hour)
+    .map((entry) => ({
+      hour: entry.hour,
+      coords: entry.coordinates,
+      previousPolygon: entry.previousPolygon || null,
+      isRing: entry.isRing || false,
+      stats: entry.stats || {}
+    }));
 
+  if (!filtered.length) {
+    setSimStatus("Tahmin verisi yok");
+    return;
+  }
+
+  forecastGroups = filtered;
   sliderEl.disabled = false;
-  sliderEl.min = 0;
-  sliderEl.max = forecastGroups.length - 1;
-  sliderEl.value = 0;
-  sliderLabelEl.innerText = "0";
-  renderForecast(0);
+  sliderEl.min = String(filtered[0].hour);
+  sliderEl.max = String(filtered[filtered.length - 1].hour);
+  sliderEl.step = 1;
+  sliderEl.value = sliderEl.min;
+  sliderLabelEl.innerText = sliderEl.min;
+  renderForecast(Number(sliderEl.min));
 }
 
 function computeCentroid(coords) {
@@ -337,6 +676,22 @@ function updateEnvironmentPanel(payload) {
   if (fwiBlock) {
     document.getElementById("fwi-value").innerText = fwiBlock.fwi.toFixed(1);
     document.getElementById("fwi-class").innerText = fwiBlock.class.toUpperCase();
+
+    // Generate FWI-based notification
+    if (fwiBlock.fwi > 20) {
+      const severity = fwiBlock.fwi > 40 ? "AŞIRI" : fwiBlock.fwi > 30 ? "ÇOK YÜKSEK" : "YÜKSEK";
+      const icon = fwiBlock.fwi > 40 ? "🔴" : fwiBlock.fwi > 30 ? "🟠" : "🟡";
+      const loc = payload.lat && payload.lon ? { lat: payload.lat, lon: payload.lon } : null;
+      setTimeout(() => {
+        showNotification(
+          `${severity} Yangın Tehlikesi`,
+          `Yangın Hava İndeksi: ${fwiBlock.fwi.toFixed(1)}\nSınıf: ${fwiBlock.class.toUpperCase()}\n${locationName}`,
+          fwiBlock.fwi > 30 ? "danger" : "warning",
+          icon,
+          loc
+        );
+      }, 2000);
+    }
   }
   const slopeDeg = payload.elevation?.slopeDegrees ?? payload.weather?.elevation?.slopeDegrees;
   if (typeof slopeDeg === "number") {
@@ -473,7 +828,12 @@ async function runSimulation() {
   simInProgress = true;
   setSimStatus("Simülasyon başlatılıyor...");
   clearForecast();
+  stopPeriodicNotifications();
+
   const { lat, lon } = computeCentroid(currentFireArea);
+  // Generate a different alert location nearby
+  const alertLocation = getAlertLocation(lat, lon);
+
   try {
     const res = await fetch(`${API_URL}/api/fire/simulation`, {
       method: "POST",
@@ -482,11 +842,32 @@ async function runSimulation() {
     });
     if (!res.ok) throw new Error(`simulation failed ${res.status}`);
     const data = await res.json();
+
+    // Update environment data
     updateEnvironmentPanel(data);
-    prepareForecast(data.features);
+
+    // Start periodic notifications with weather anomalies at alert location
+    startPeriodicNotifications(data.weather, alertLocation);
+
+    // Initial notification
+    showNotification(
+      "Simülasyon Başlatıldı",
+      `Yangın yayılma simülasyonu başlatıldı\nKonum: ${locationName}\n${data.meta?.hours || 8} saat izleniyor`,
+      "info",
+      "🔥",
+      alertLocation
+    );
+
+    prepareForecast(data.forecast);
   } catch (err) {
     console.error(err);
     setSimStatus("Simülasyon başarısız");
+    showNotification(
+      "Simülasyon Başarısız",
+      `Simülasyon çalıştırılamadı\nLütfen tekrar deneyin`,
+      "danger",
+      "❌"
+    );
   } finally {
     simInProgress = false;
   }
