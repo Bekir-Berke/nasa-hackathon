@@ -114,6 +114,7 @@
       <option value="topo">🌄 Topo</option>
     </select>
     <button id="modeToggle" class="btn">🌙 Gece</button>
+    <button id="simulateBtn" class="btn">🔥 Simülasyon</button>
     <div class="clock" id="clock">--:--:--</div>
   </div>
 </div>
@@ -124,6 +125,16 @@
     <h3>💨 Rüzgar</h3>
     <div class="info-line"><span>Yön:</span><span id="wind-dir">-</span></div>
     <div class="info-line"><span>Hız:</span><span id="wind-speed">-</span></div>
+  </div>
+  <div class="section">
+    <h3>🔥 Yangın İndeksi</h3>
+    <div class="info-line"><span>FWI:</span><span id="fwi-value">-</span></div>
+    <div class="info-line"><span>Sınıf:</span><span id="fwi-class">-</span></div>
+    <div class="info-line"><span>Eğim:</span><span id="slope-value">-</span></div>
+  </div>
+  <div class="section">
+    <h3>🧪 Simülasyon</h3>
+    <div class="info-line"><span>Durum:</span><span id="sim-status">Hazır</span></div>
   </div>
   <div class="section">
     <h3>👨‍🚒 İtfaiyeciler</h3>
@@ -140,14 +151,23 @@
 <script>
 const { Map, View, layer, source, geom, Feature, style } = ol;
 const API_URL = "http://localhost:5000";
-const socket = io(API_URL, { transports:["websocket"] });
+const socket = io(API_URL, { transports: ["websocket"] });
 
-/* === SAAT === */
-setInterval(()=>{
-  document.getElementById("clock").innerText = new Date().toLocaleTimeString("tr-TR",{hour12:false});
-},1000);
+let currentFireArea = [];
+let environmentData = null;
+let lastEnvironmentFetch = 0;
+let forecastAnimationHandle = null;
+let forecastGroups = [];
+let forecastIndex = 0;
+let simInProgress = false;
+let windDeg = 0;
+let windSpeed = 2.5;
 
-/* === HARİTA VE KATLAR === */
+const clockEl = document.getElementById("clock");
+setInterval(() => {
+  clockEl.innerText = new Date().toLocaleTimeString("tr-TR", { hour12: false });
+}, 1000);
+
 const osm = new layer.Tile({ source: new source.OSM() });
 const satellite = new layer.Tile({
   source: new source.XYZ({ url: "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}" })
@@ -159,39 +179,45 @@ const topo = new layer.Tile({
 const map = new Map({
   target: "map",
   layers: [osm],
-  view: new View({ center: ol.proj.fromLonLat([30.49,37.05]), zoom: 12 })
+  view: new View({ center: ol.proj.fromLonLat([30.49, 37.05]), zoom: 12 })
 });
 
-document.getElementById("layerSelect").addEventListener("change", (e)=>{
-  map.getLayers().setAt(0, e.target.value === "satellite" ? satellite : e.target.value === "topo" ? topo : osm);
+document.getElementById("layerSelect").addEventListener("change", (e) => {
+  const value = e.target.value;
+  map.getLayers().setAt(0, value === "satellite" ? satellite : value === "topo" ? topo : osm);
 });
 
-/* === DARK/LIGHT TOGGLE === */
 const modeBtn = document.getElementById("modeToggle");
 modeBtn.onclick = () => {
   const light = document.body.classList.toggle("light");
   modeBtn.textContent = light ? "🌞 Gündüz" : "🌙 Gece";
 };
 
-/* === TOOLTIP === */
+document.getElementById("simulateBtn").addEventListener("click", runSimulation);
+
 const tooltip = document.createElement("div");
 tooltip.className = "ol-tooltip";
 tooltip.style.display = "none";
 document.body.appendChild(tooltip);
-map.on("pointermove", e=>{
-  const feature = map.forEachFeatureAtPixel(e.pixel, f=>f);
-  if(feature && feature.get("label")){
+map.on("pointermove", (e) => {
+  const feature = map.forEachFeatureAtPixel(e.pixel, (f) => f);
+  if (feature && feature.get("label")) {
     tooltip.innerText = feature.get("label");
-    tooltip.style.left = e.pixel[0] + 15 + "px";
-    tooltip.style.top = e.pixel[1] + "px";
+    tooltip.style.left = `${e.pixel[0] + 15}px`;
+    tooltip.style.top = `${e.pixel[1]}px`;
     tooltip.style.display = "block";
-  } else tooltip.style.display = "none";
+  } else {
+    tooltip.style.display = "none";
+  }
 });
 
-/* === LAYERS === */
 const fireSource = new source.Vector();
 const fireLayer = new layer.Vector({ source: fireSource });
 map.addLayer(fireLayer);
+
+const forecastSource = new source.Vector();
+const forecastLayer = new layer.Vector({ source: forecastSource });
+map.addLayer(forecastLayer);
 
 const ffSource = new source.Vector();
 const ffLayer = new layer.Vector({ source: ffSource });
@@ -205,104 +231,276 @@ const windSource = new source.Vector();
 const windLayer = new layer.Vector({ source: windSource });
 map.addLayer(windLayer);
 
-/* === YANGIN ALANI === */
-let firePolygonFeature, pulsePhase=0;
-function drawFireArea(coords){
+let firePolygonFeature;
+let pulsePhase = 0;
+
+function setSimStatus(text) {
+  document.getElementById("sim-status").innerText = text;
+}
+
+function computeCentroid(coords) {
+  if (!coords || !coords.length) return { lat: 37.05, lon: 30.49 };
+  let sumLat = 0;
+  let sumLon = 0;
+  coords.forEach(([lat, lon]) => {
+    sumLat += lat;
+    sumLon += lon;
+  });
+  return { lat: sumLat / coords.length, lon: sumLon / coords.length };
+}
+
+function updateEnvironmentPanel(payload) {
+  if (!payload) return;
+  const fwiBlock = payload.fwi;
+  if (fwiBlock) {
+    document.getElementById("fwi-value").innerText = fwiBlock.fwi.toFixed(1);
+    document.getElementById("fwi-class").innerText = fwiBlock.class.toUpperCase();
+  }
+  const slopeDeg = payload.elevation?.slopeDegrees ?? payload.weather?.elevation?.slopeDegrees;
+  if (typeof slopeDeg === "number") {
+    document.getElementById("slope-value").innerText = `${slopeDeg.toFixed(1)}°`;
+  }
+  const summary = payload.weather?.summary;
+  if (summary) {
+    if (typeof summary.wind_direction_10m === "number") {
+      windDeg = summary.wind_direction_10m;
+    }
+    if (typeof summary.wind_speed_10m === "number") {
+      windSpeed = summary.wind_speed_10m;
+    }
+    document.getElementById("wind-dir").innerText = `${Math.round((windDeg + 360) % 360)}°`;
+    document.getElementById("wind-speed").innerText = `${windSpeed.toFixed(1)} m/s`;
+  }
+}
+
+async function refreshEnvironment(force = false) {
+  if (!currentFireArea.length) return environmentData;
+  const now = Date.now();
+  if (!force && now - lastEnvironmentFetch < 5 * 60 * 1000) return environmentData;
+  const { lat, lon } = computeCentroid(currentFireArea);
+  try {
+    const res = await fetch(`${API_URL}/api/environment?lat=${lat}&lon=${lon}`);
+    if (!res.ok) throw new Error("environment request failed");
+    const data = await res.json();
+    environmentData = data;
+    lastEnvironmentFetch = now;
+    updateEnvironmentPanel(data);
+    return data;
+  } catch (err) {
+    console.error(err);
+    if (!simInProgress) setSimStatus("Çevre verisi alınamadı");
+    return null;
+  }
+}
+
+function drawFireArea(coords) {
+  currentFireArea = Array.isArray(coords) ? coords : [];
   fireSource.clear();
-  const lonLat = coords.map(([lat, lon]) => ol.proj.fromLonLat([lon, lat]));
+  if (!currentFireArea.length) {
+    return;
+  }
+  const lonLat = currentFireArea.map(([lat, lon]) => ol.proj.fromLonLat([lon, lat]));
   const poly = new geom.Polygon([lonLat]);
   firePolygonFeature = new Feature(poly);
   fireSource.addFeature(firePolygonFeature);
-  pulsePhase = 0; animateFireArea();
-}
-function animateFireArea(){
-  pulsePhase += 0.05;
-  const p=(Math.sin(pulsePhase)+1)/2;
-  fireLayer.setStyle(new style.Style({
-    fill:new style.Fill({color:`rgba(255,${80+120*p},0,${0.3+0.3*p})`}),
-    stroke:new style.Stroke({color:`rgba(255,60,0,${0.6+0.4*p})`,width:2+2*p})
-  }));
-  map.render(); requestAnimationFrame(animateFireArea);
+  pulsePhase = 0;
+  animateFireArea();
 }
 
-/* === İTFAİYECİLER === */
-function drawFirefighters(list){
+function animateFireArea() {
+  if (!firePolygonFeature) return;
+  pulsePhase += 0.05;
+  const p = (Math.sin(pulsePhase) + 1) / 2;
+  fireLayer.setStyle(new style.Style({
+    fill: new style.Fill({ color: `rgba(255,${80 + 120 * p},0,${0.3 + 0.3 * p})` }),
+    stroke: new style.Stroke({ color: `rgba(255,60,0,${0.6 + 0.4 * p})`, width: 2 + 2 * p })
+  }));
+  map.render();
+  requestAnimationFrame(animateFireArea);
+}
+
+function drawFirefighters(list) {
   ffSource.clear();
-  const teamDiv=document.getElementById("team"); teamDiv.innerHTML="";
-  list.forEach(f=>{
-    const color=f.status==="in-danger"?"#ef4444":(f.status==="resting"?"#9ca3af":"#22c55e");
-    const pt=new geom.Point(ol.proj.fromLonLat([f.lon,f.lat]));
-    const ft=new Feature(pt);
-    ft.set("label",`${f.name} (${f.status})`);
+  const teamDiv = document.getElementById("team");
+  teamDiv.innerHTML = "";
+  list.forEach((f) => {
+    const color = f.status === "in-danger" ? "#ef4444" : (f.status === "resting" ? "#9ca3af" : "#22c55e");
+    const pt = new geom.Point(ol.proj.fromLonLat([f.lon, f.lat]));
+    const ft = new Feature(pt);
+    ft.set("label", `${f.name} (${f.status})`);
     ft.setStyle(new style.Style({
-      image:new style.Circle({radius:7,fill:new style.Fill({color}),stroke:new style.Stroke({color:"#fff",width:2})})
+      image: new style.Circle({
+        radius: 7,
+        fill: new style.Fill({ color }),
+        stroke: new style.Stroke({ color: "#fff", width: 2 })
+      })
     }));
     ffSource.addFeature(ft);
-    const cls=f.status==="in-danger"?"danger":(f.status==="resting"?"rest":"active");
-    teamDiv.insertAdjacentHTML("beforeend",`<div class="list-item"><span class="dot ${cls}"></span>${f.name}</div>`);
+    const cls = f.status === "in-danger" ? "danger" : (f.status === "resting" ? "rest" : "active");
+    teamDiv.insertAdjacentHTML("beforeend", `<div class="list-item"><span class="dot ${cls}"></span>${f.name}</div>`);
   });
 }
 
-/* === DRONELAR === */
-const droneIcon='data:image/svg+xml;base64,'+btoa(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#38bdf8" stroke="#0ea5e9" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M3 12h3m12 0h3M12 3v3m0 12v3"/></svg>`);
-function drawDrones(list){
+const droneIcon = "data:image/svg+xml;base64," + btoa(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#38bdf8" stroke="#0ea5e9" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M3 12h3m12 0h3M12 3v3m0 12v3"/></svg>`);
+function drawDrones(list) {
   droneSource.clear();
-  const div=document.getElementById("drones"); div.innerHTML="";
-  list.forEach(d=>{
-    const pt=new geom.Point(ol.proj.fromLonLat([d.lon,d.lat]));
-    const ft=new Feature(pt);
-    ft.set("label",`${d.name} - ${d.status}`);
-    ft.setStyle(new style.Style({image:new style.Icon({src:droneIcon,scale:1.2})}));
+  const div = document.getElementById("drones");
+  div.innerHTML = "";
+  list.forEach((d) => {
+    const pt = new geom.Point(ol.proj.fromLonLat([d.lon, d.lat]));
+    const ft = new Feature(pt);
+    ft.set("label", `${d.name} - ${d.status}`);
+    ft.setStyle(new style.Style({ image: new style.Icon({ src: droneIcon, scale: 1.2 }) }));
     droneSource.addFeature(ft);
-    div.insertAdjacentHTML("beforeend",`<div class="list-item"><span class="dot drone"></span>${d.name}</div>`);
+    div.insertAdjacentHTML("beforeend", `<div class="list-item"><span class="dot drone"></span>${d.name}</div>`);
   });
 }
 
-/* === RÜZGAR === */
-const arrowBase64='data:image/svg+xml;base64,'+btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" stroke="#38bdf8" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12h18l-4-4m4 4-4 4"/></svg>');
-const arrows=[]; [[30.46,37.05],[30.48,37.07],[30.5,37.05],[30.52,37.03]].forEach(([lon,lat])=>{
-  const f=new Feature(new geom.Point(ol.proj.fromLonLat([lon,lat]))); f.set("base",[lon,lat]); arrows.push(f); windSource.addFeature(f);
+const arrowBase64 = "data:image/svg+xml;base64," + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" stroke="#38bdf8" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12h18l-4-4m4 4-4 4"/></svg>');
+const arrows = [];
+[[30.46, 37.05], [30.48, 37.07], [30.5, 37.05], [30.52, 37.03]].forEach(([lon, lat]) => {
+  const f = new Feature(new geom.Point(ol.proj.fromLonLat([lon, lat])));
+  f.set("base", [lon, lat]);
+  arrows.push(f);
+  windSource.addFeature(f);
 });
-let windDeg=270,windSpeed=5;
-async function updateWindData(){
-  const lat=37.05,lon=30.49,apiKey="1312439b552a4bd81ad8d6699b0b6688";
-  try{
-    const res=await fetch(`https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&appid=${apiKey}&units=metric`);
-    const data=await res.json(); windDeg=data.wind.deg; windSpeed=data.wind.speed;
-    document.getElementById("wind-dir").innerText=`${windDeg}°`;
-    document.getElementById("wind-speed").innerText=`${windSpeed} m/s`;
-  }catch(e){console.error(e);}
-}
-function animateWindArrows(){
-  const rad=(windDeg+180)*Math.PI/180; const mv=0.001+windSpeed*0.0001;
-  arrows.forEach(f=>{
-    const [lon,lat]=f.get("base"); const t=Date.now()/1000;
-    const dx=Math.cos(rad)*Math.sin(t+lon*5)*mv; const dy=Math.sin(rad)*Math.sin(t+lon*5)*mv;
-    f.setGeometry(new geom.Point(ol.proj.fromLonLat([lon+dx,lat+dy])));
+
+function animateWindArrows() {
+  const rad = (windDeg + 180) * Math.PI / 180;
+  const mv = 0.001 + windSpeed * 0.0001;
+  arrows.forEach((f) => {
+    const [lon, lat] = f.get("base");
+    const t = Date.now() / 1000;
+    const dx = Math.cos(rad) * Math.sin(t + lon * 5) * mv;
+    const dy = Math.sin(rad) * Math.sin(t + lon * 5) * mv;
+    f.setGeometry(new geom.Point(ol.proj.fromLonLat([lon + dx, lat + dy])));
   });
-  windLayer.setStyle(new style.Style({image:new style.Icon({src:arrowBase64,rotation:rad,scale:1.3,opacity:0.9})}));
-  map.render(); requestAnimationFrame(animateWindArrows);
+  windLayer.setStyle(new style.Style({
+    image: new style.Icon({ src: arrowBase64, rotation: rad, scale: 1.3, opacity: 0.9 })
+  }));
+  map.render();
+  requestAnimationFrame(animateWindArrows);
 }
 
-/* === DATA LOAD === */
-async function loadAll(){
-  const [ffs,fa,dr]=await Promise.all([
-    fetch(`${API_URL}/api/firefighters`).then(r=>r.json()),
-    fetch(`${API_URL}/api/firearea`).then(r=>r.json()),
-    fetch(`${API_URL}/api/drones`).then(r=>r.json())
+function forecastFill(step, total) {
+  const ratio = total <= 1 ? 1 : step / (total - 1);
+  const r = 255;
+  const g = Math.round(210 - 120 * ratio);
+  const b = Math.round(90 - 60 * ratio);
+  const alpha = 0.18 + 0.25 * ratio;
+  return { fill: `rgba(${r},${g},${b},${alpha})`, stroke: `rgba(255,86,48,${0.45 + 0.35 * ratio})` };
+}
+
+function clearForecast() {
+  forecastSource.clear();
+  forecastGroups = [];
+  forecastIndex = 0;
+  if (forecastAnimationHandle) {
+    clearTimeout(forecastAnimationHandle);
+    forecastAnimationHandle = null;
+  }
+}
+
+function animateForecast(rawFeatures) {
+  clearForecast();
+  if (!Array.isArray(rawFeatures) || !rawFeatures.length) {
+    setSimStatus("Tahmin verisi yok");
+    return;
+  }
+  rawFeatures.sort((a, b) => (a.properties?.hour ?? 0) - (b.properties?.hour ?? 0));
+  const grouped = [];
+  rawFeatures.forEach((feature) => {
+    const hour = feature.properties?.hour ?? 0;
+    if (!grouped[hour]) grouped[hour] = [];
+    grouped[hour].push(feature);
+  });
+  forecastGroups = grouped.filter(Boolean);
+  setSimStatus("Simülasyon oynatılıyor...");
+  const total = forecastGroups.length;
+
+  function step() {
+    if (forecastIndex >= forecastGroups.length) {
+      setSimStatus("Tamamlandı");
+      forecastAnimationHandle = null;
+      return;
+    }
+    const group = forecastGroups[forecastIndex];
+    const colors = forecastFill(forecastIndex, total);
+    group.forEach((feature) => {
+      const polygon = feature.geometry.coordinates[0].map(([lon, lat]) => ol.proj.fromLonLat([lon, lat]));
+      const poly = new geom.Polygon([polygon]);
+      const ft = new Feature(poly);
+      ft.setStyle(new style.Style({
+        fill: new style.Fill({ color: colors.fill }),
+        stroke: new style.Stroke({ color: colors.stroke, width: 1 })
+      }));
+      forecastSource.addFeature(ft);
+    });
+    setSimStatus(`Saat +${forecastIndex} (${forecastSource.getFeatures().length} hücre)`);
+    forecastIndex += 1;
+    forecastAnimationHandle = setTimeout(step, 900);
+  }
+
+  step();
+}
+
+async function runSimulation() {
+  if (simInProgress) return;
+  if (!currentFireArea.length) {
+    setSimStatus("Yangın alanı yok");
+    return;
+  }
+  simInProgress = true;
+  setSimStatus("Simülasyon başlatılıyor...");
+  clearForecast();
+  const { lat, lon } = computeCentroid(currentFireArea);
+  try {
+    const res = await fetch(`${API_URL}/api/fire/simulation`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lat, lon })
+    });
+    if (!res.ok) throw new Error(`simulation failed ${res.status}`);
+    const data = await res.json();
+    updateEnvironmentPanel(data);
+    animateForecast(data.features);
+  } catch (err) {
+    console.error(err);
+    setSimStatus("Simülasyon başarısız");
+  } finally {
+    simInProgress = false;
+  }
+}
+
+async function loadAll() {
+  const [ffs, fa, dr] = await Promise.all([
+    fetch(`${API_URL}/api/firefighters`).then((r) => r.json()),
+    fetch(`${API_URL}/api/firearea`).then((r) => r.json()),
+    fetch(`${API_URL}/api/drones`).then((r) => r.json())
   ]);
-  drawFirefighters(ffs); drawFireArea(fa); drawDrones(dr);
+  drawFirefighters(ffs);
+  drawFireArea(fa);
+  drawDrones(dr);
+  await refreshEnvironment(true);
 }
-loadAll(); updateWindData(); animateWindArrows();
-setInterval(updateWindData,5*60*1000);
 
-/* === SOCKET === */
-socket.on("firefighters:init",drawFirefighters);
-socket.on("firefighters:update",drawFirefighters);
-socket.on("firearea:init",drawFireArea);
-socket.on("firearea:update",drawFireArea);
-socket.on("drones:init",drawDrones);
-socket.on("drones:update",drawDrones);
+socket.on("firefighters:init", drawFirefighters);
+socket.on("firefighters:update", drawFirefighters);
+socket.on("firearea:init", (coords) => {
+  drawFireArea(coords);
+  refreshEnvironment(true);
+});
+socket.on("firearea:update", (coords) => {
+  drawFireArea(coords);
+  refreshEnvironment(true);
+});
+socket.on("drones:init", drawDrones);
+socket.on("drones:update", drawDrones);
+socket.on("fire:forecast", animateForecast);
+
+loadAll();
+animateWindArrows();
 </script>
+
 </body>
 </html>
