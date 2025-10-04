@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <title>🔥 FireMap - Live Dashboard</title>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@latest/ol.css">
+  <script src="https://cdn.jsdelivr.net/npm/ol@latest/dist/ol.js"></script>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+
+  <style>
+    /* === GENEL === */
+    html, body {
+      margin:0; padding:0;
+      height:100%; width:100%;
+      font-family:"Inter",sans-serif;
+      color:#fff; overflow:hidden;
+      background: var(--bg, radial-gradient(circle at 20% 30%, #0f172a, #020617));
+      transition: background 0.4s ease;
+    }
+    #map { height:100vh; width:100vw; }
+
+    /* === ÜST BAR === */
+    .topbar {
+      position:absolute; top:0; left:0; right:0;
+      height:55px; display:flex; justify-content:space-between; align-items:center;
+      padding:0 24px; backdrop-filter:blur(12px);
+      background:rgba(17,25,40,.75);
+      border-bottom:1px solid rgba(255,255,255,.08);
+      z-index:1000;
+    }
+    .brand { font-weight:600; font-size:18px; color:#facc15; display:flex; align-items:center; gap:8px;}
+    .brand svg { width:22px; height:22px; fill:#facc15; }
+    .clock { font-size:14px; color:#94a3b8; }
+
+    /* === KONTROLLER === */
+    .controls {
+      display:flex; align-items:center; gap:12px;
+    }
+    .btn {
+      background:rgba(255,255,255,0.08);
+      border:1px solid rgba(255,255,255,0.15);
+      color:#f8fafc;
+      padding:6px 10px;
+      border-radius:8px;
+      cursor:pointer;
+      font-size:13px;
+      backdrop-filter:blur(6px);
+      transition: all 0.2s;
+    }
+    .btn:hover { background:rgba(255,255,255,0.15); }
+
+    /* === SAĞ PANEL === */
+    .panel{
+      position:absolute; top:70px; right:20px; width:300px;
+      background:rgba(17,25,40,.85); backdrop-filter:blur(10px);
+      border-radius:16px; box-shadow:0 4px 30px rgba(0,0,0,.4);
+      padding:18px 20px; z-index:900; border:1px solid rgba(255,255,255,.06);
+    }
+    .panel h3{ margin:0 0 8px; font-size:15px; color:#facc15; font-weight:600;}
+    .section{ margin-bottom:18px; }
+    .info-line{ display:flex; justify-content:space-between; font-size:13px; color:#cbd5e1; margin-bottom:4px; }
+    .list-item{ display:flex; align-items:center; gap:8px; margin:5px 0; font-size:13px; color:#e2e8f0;}
+    .dot{ width:10px; height:10px; border-radius:50%; }
+    .active{ background:#22c55e; } .danger{ background:#ef4444; } .rest{ background:#9ca3af; } .drone{ background:#38bdf8; }
+
+    /* === TOOLTIP === */
+    .ol-tooltip {
+      position: absolute;
+      background: rgba(17,25,40,.9);
+      color: #fff;
+      padding: 4px 8px;
+      border-radius: 8px;
+      white-space: nowrap;
+      font-size: 12px;
+      border: 1px solid rgba(255,255,255,.1);
+    }
+    .ol-tooltip:after {
+      content: "";
+      border-top: 6px solid rgba(17,25,40,.9);
+      border-left: 6px solid transparent;
+      border-right: 6px solid transparent;
+      position: absolute;
+      bottom: -6px;
+      left: calc(50% - 6px);
+    }
+
+    /* === LIGHT MODE === */
+    body.light {
+      --bg: radial-gradient(circle at 20% 30%, #f1f5f9, #cbd5e1);
+      color:#0f172a;
+    }
+    body.light .topbar, body.light .panel {
+      background: rgba(255,255,255,0.85);
+      color:#0f172a;
+      border-color: rgba(0,0,0,0.1);
+    }
+    body.light .btn { background:rgba(0,0,0,0.05); color:#111827; border-color:rgba(0,0,0,0.1);}
+    body.light .btn:hover { background:rgba(0,0,0,0.1); }
+  </style>
+</head>
+<body>
+
+<!-- === ÜST BAR === -->
+<div class="topbar">
+  <div class="brand">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zm0 8l10 5-10 5L2 15l10-5z"/></svg>
+    FireMap Dashboard
+  </div>
+  <div class="controls">
+    <select id="layerSelect" class="btn">
+      <option value="osm">🗺️ Harita</option>
+      <option value="satellite">🛰️ Uydu</option>
+      <option value="topo">🌄 Topo</option>
+    </select>
+    <button id="modeToggle" class="btn">🌙 Gece</button>
+    <div class="clock" id="clock">--:--:--</div>
+  </div>
+</div>
+
+<!-- === SAĞ PANEL === -->
+<div class="panel">
+  <div class="section">
+    <h3>💨 Rüzgar</h3>
+    <div class="info-line"><span>Yön:</span><span id="wind-dir">-</span></div>
+    <div class="info-line"><span>Hız:</span><span id="wind-speed">-</span></div>
+  </div>
+  <div class="section">
+    <h3>👨‍🚒 İtfaiyeciler</h3>
+    <div id="team"></div>
+  </div>
+  <div class="section">
+    <h3>🚁 Dronelar</h3>
+    <div id="drones"></div>
+  </div>
+</div>
+
+<div id="map"></div>
+
+<script>
+const { Map, View, layer, source, geom, Feature, style } = ol;
+const API_URL = "http://localhost:5000";
+const socket = io(API_URL, { transports:["websocket"] });
+
+/* === SAAT === */
+setInterval(()=>{
+  document.getElementById("clock").innerText = new Date().toLocaleTimeString("tr-TR",{hour12:false});
+},1000);
+
+/* === HARİTA VE KATLAR === */
+const osm = new layer.Tile({ source: new source.OSM() });
+const satellite = new layer.Tile({
+  source: new source.XYZ({ url: "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}" })
+});
+const topo = new layer.Tile({
+  source: new source.XYZ({ url: "https://{a}.tile.opentopomap.org/{z}/{x}/{y}.png" })
+});
+
+const map = new Map({
+  target: "map",
+  layers: [osm],
+  view: new View({ center: ol.proj.fromLonLat([30.49,37.05]), zoom: 12 })
+});
+
+document.getElementById("layerSelect").addEventListener("change", (e)=>{
+  map.getLayers().setAt(0, e.target.value === "satellite" ? satellite : e.target.value === "topo" ? topo : osm);
+});
+
+/* === DARK/LIGHT TOGGLE === */
+const modeBtn = document.getElementById("modeToggle");
+modeBtn.onclick = () => {
+  const light = document.body.classList.toggle("light");
+  modeBtn.textContent = light ? "🌞 Gündüz" : "🌙 Gece";
+};
+
+/* === TOOLTIP === */
+const tooltip = document.createElement("div");
+tooltip.className = "ol-tooltip";
+tooltip.style.display = "none";
+document.body.appendChild(tooltip);
+map.on("pointermove", e=>{
+  const feature = map.forEachFeatureAtPixel(e.pixel, f=>f);
+  if(feature && feature.get("label")){
+    tooltip.innerText = feature.get("label");
+    tooltip.style.left = e.pixel[0] + 15 + "px";
+    tooltip.style.top = e.pixel[1] + "px";
+    tooltip.style.display = "block";
+  } else tooltip.style.display = "none";
+});
+
+/* === LAYERS === */
+const fireSource = new source.Vector();
+const fireLayer = new layer.Vector({ source: fireSource });
+map.addLayer(fireLayer);
+
+const ffSource = new source.Vector();
+const ffLayer = new layer.Vector({ source: ffSource });
+map.addLayer(ffLayer);
+
+const droneSource = new source.Vector();
+const droneLayer = new layer.Vector({ source: droneSource });
+map.addLayer(droneLayer);
+
+const windSource = new source.Vector();
+const windLayer = new layer.Vector({ source: windSource });
+map.addLayer(windLayer);
+
+/* === YANGIN ALANI === */
+let firePolygonFeature, pulsePhase=0;
+function drawFireArea(coords){
+  fireSource.clear();
+  const lonLat = coords.map(([lat, lon]) => ol.proj.fromLonLat([lon, lat]));
+  const poly = new geom.Polygon([lonLat]);
+  firePolygonFeature = new Feature(poly);
+  fireSource.addFeature(firePolygonFeature);
+  pulsePhase = 0; animateFireArea();
+}
+function animateFireArea(){
+  pulsePhase += 0.05;
+  const p=(Math.sin(pulsePhase)+1)/2;
+  fireLayer.setStyle(new style.Style({
+    fill:new style.Fill({color:`rgba(255,${80+120*p},0,${0.3+0.3*p})`}),
+    stroke:new style.Stroke({color:`rgba(255,60,0,${0.6+0.4*p})`,width:2+2*p})
+  }));
+  map.render(); requestAnimationFrame(animateFireArea);
+}
+
+/* === İTFAİYECİLER === */
+function drawFirefighters(list){
+  ffSource.clear();
+  const teamDiv=document.getElementById("team"); teamDiv.innerHTML="";
+  list.forEach(f=>{
+    const color=f.status==="in-danger"?"#ef4444":(f.status==="resting"?"#9ca3af":"#22c55e");
+    const pt=new geom.Point(ol.proj.fromLonLat([f.lon,f.lat]));
+    const ft=new Feature(pt);
+    ft.set("label",`${f.name} (${f.status})`);
+    ft.setStyle(new style.Style({
+      image:new style.Circle({radius:7,fill:new style.Fill({color}),stroke:new style.Stroke({color:"#fff",width:2})})
+    }));
+    ffSource.addFeature(ft);
+    const cls=f.status==="in-danger"?"danger":(f.status==="resting"?"rest":"active");
+    teamDiv.insertAdjacentHTML("beforeend",`<div class="list-item"><span class="dot ${cls}"></span>${f.name}</div>`);
+  });
+}
+
+/* === DRONELAR === */
+const droneIcon='data:image/svg+xml;base64,'+btoa(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#38bdf8" stroke="#0ea5e9" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M3 12h3m12 0h3M12 3v3m0 12v3"/></svg>`);
+function drawDrones(list){
+  droneSource.clear();
+  const div=document.getElementById("drones"); div.innerHTML="";
+  list.forEach(d=>{
+    const pt=new geom.Point(ol.proj.fromLonLat([d.lon,d.lat]));
+    const ft=new Feature(pt);
+    ft.set("label",`${d.name} - ${d.status}`);
+    ft.setStyle(new style.Style({image:new style.Icon({src:droneIcon,scale:1.2})}));
+    droneSource.addFeature(ft);
+    div.insertAdjacentHTML("beforeend",`<div class="list-item"><span class="dot drone"></span>${d.name}</div>`);
+  });
+}
+
+/* === RÜZGAR === */
+const arrowBase64='data:image/svg+xml;base64,'+btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" stroke="#38bdf8" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12h18l-4-4m4 4-4 4"/></svg>');
+const arrows=[]; [[30.46,37.05],[30.48,37.07],[30.5,37.05],[30.52,37.03]].forEach(([lon,lat])=>{
+  const f=new Feature(new geom.Point(ol.proj.fromLonLat([lon,lat]))); f.set("base",[lon,lat]); arrows.push(f); windSource.addFeature(f);
+});
+let windDeg=270,windSpeed=5;
+async function updateWindData(){
+  const lat=37.05,lon=30.49,apiKey="1312439b552a4bd81ad8d6699b0b6688";
+  try{
+    const res=await fetch(`https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&appid=${apiKey}&units=metric`);
+    const data=await res.json(); windDeg=data.wind.deg; windSpeed=data.wind.speed;
+    document.getElementById("wind-dir").innerText=`${windDeg}°`;
+    document.getElementById("wind-speed").innerText=`${windSpeed} m/s`;
+  }catch(e){console.error(e);}
+}
+function animateWindArrows(){
+  const rad=(windDeg+180)*Math.PI/180; const mv=0.001+windSpeed*0.0001;
+  arrows.forEach(f=>{
+    const [lon,lat]=f.get("base"); const t=Date.now()/1000;
+    const dx=Math.cos(rad)*Math.sin(t+lon*5)*mv; const dy=Math.sin(rad)*Math.sin(t+lon*5)*mv;
+    f.setGeometry(new geom.Point(ol.proj.fromLonLat([lon+dx,lat+dy])));
+  });
+  windLayer.setStyle(new style.Style({image:new style.Icon({src:arrowBase64,rotation:rad,scale:1.3,opacity:0.9})}));
+  map.render(); requestAnimationFrame(animateWindArrows);
+}
+
+/* === DATA LOAD === */
+async function loadAll(){
+  const [ffs,fa,dr]=await Promise.all([
+    fetch(`${API_URL}/api/firefighters`).then(r=>r.json()),
+    fetch(`${API_URL}/api/firearea`).then(r=>r.json()),
+    fetch(`${API_URL}/api/drones`).then(r=>r.json())
+  ]);
+  drawFirefighters(ffs); drawFireArea(fa); drawDrones(dr);
+}
+loadAll(); updateWindData(); animateWindArrows();
+setInterval(updateWindData,5*60*1000);
+
+/* === SOCKET === */
+socket.on("firefighters:init",drawFirefighters);
+socket.on("firefighters:update",drawFirefighters);
+socket.on("firearea:init",drawFireArea);
+socket.on("firearea:update",drawFireArea);
+socket.on("drones:init",drawDrones);
+socket.on("drones:update",drawDrones);
+</script>
+</body>
+</html>
