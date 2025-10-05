@@ -211,10 +211,23 @@
     <div class="info-line"><span>Hız:</span><span id="wind-speed">-</span></div>
   </div>
   <div class="section">
+    <h3>📡 Mesh Ağ Durumu</h3>
+    <div class="info-line"><span>Bağlantılar:</span><span id="mesh-count">0</span></div>
+    <div class="info-line"><span>Aktif:</span><span id="mesh-active">0</span></div>
+  </div>
+  <div class="section">
     <h3>🔥 Yangın İndeksi</h3>
     <div class="info-line"><span>FWI:</span><span id="fwi-value">-</span></div>
     <div class="info-line"><span>Sınıf:</span><span id="fwi-class">-</span></div>
     <div class="info-line"><span>Eğim:</span><span id="slope-value">-</span></div>
+  </div>
+  <div class="section">
+    <h3>📊 Yangın Analizi</h3>
+    <div class="info-line"><span>Merkez:</span><span id="analysis-center">-</span></div>
+    <div class="info-line"><span>Yarıçap:</span><span id="analysis-radius">-</span></div>
+    <div class="info-line"><span>Arama Çapı:</span><span id="analysis-searchradius">-</span></div>
+    <div class="info-line"><span>Aday Sayısı:</span><span id="analysis-candidate-count">-</span></div>
+    <div class="info-line"><span>Aday Hücre:</span><span id="analysis-bestcell">-</span></div>
   </div>
   <div class="section">
     <h3>🧪 Simülasyon</h3>
@@ -236,7 +249,7 @@
 
 <script>
 const { Map, View, layer, source, geom, Feature, style } = ol;
-const API_URL = "http://localhost:5001";
+const API_URL = "http://localhost:5000";
 const socket = io(API_URL, { transports: ["websocket"] });
 
 let currentFireArea = [];
@@ -251,6 +264,13 @@ let notificationInterval = null;
 let locationName = "Denizli, Türkiye";
 let dangerMarkerSource = null;
 let dangerMarkerLayer = null;
+let fireAnalysisData = null;
+let suppressAutoAnalysis = false;
+let forecastPlaybackTimer = null;
+let forecastAutoPlay = false;
+
+const DEGREE_TO_KM = 111.139;
+const FORECAST_PLAYBACK_INTERVAL = 2000;
 
 // Fixed alert location: 37°41'24.6"N 29°05'04.9"E
 function getAlertLocation(baseLat, baseLon) {
@@ -473,6 +493,7 @@ const sliderEl = document.getElementById("sim-slider");
 const sliderLabelEl = document.getElementById("sim-hour");
 resetForecastSlider();
 sliderEl.addEventListener("input", (event) => {
+  stopForecastPlayback();
   renderForecast(event.target.value);
 });
 
@@ -523,10 +544,16 @@ map.on("pointermove", (e) => {
     tooltip.style.display = "none";
   }
 });
+let firefightersCache = [];
+let dronesCache = [];
 
 const fireSource = new source.Vector();
 const fireLayer = new layer.Vector({ source: fireSource });
 map.addLayer(fireLayer);
+
+const fireAnalysisSource = new source.Vector();
+const fireAnalysisLayer = new layer.Vector({ source: fireAnalysisSource, zIndex: 40 });
+map.addLayer(fireAnalysisLayer);
 
 const forecastSource = new source.Vector();
 const forecastLayer = new layer.Vector({ source: forecastSource });
@@ -543,6 +570,43 @@ map.addLayer(droneLayer);
 const windSource = new source.Vector();
 const windLayer = new layer.Vector({ source: windSource });
 map.addLayer(windLayer);
+// === MESH AĞI ===
+const meshSource = new ol.source.Vector();
+const meshLayer = new ol.layer.Vector({ source: meshSource });
+map.addLayer(meshLayer);
+
+function findNodeById(id) {
+  // node ID'leri hem itfaiyeciler hem dronelarda olabilir
+  const allNodes = [...firefightersCache, ...dronesCache];
+  return allNodes.find(n => n.id === id);
+}
+
+function drawMeshLinks(links) {
+  meshSource.clear();
+  const list = Array.isArray(links) ? links : [];
+  const total = list.length;
+  const active = list.filter((l) => l.active).length;
+  document.getElementById("mesh-count").innerText = total;
+  document.getElementById("mesh-active").innerText = active;
+  list.forEach((link) => {
+    const a = findNodeById(link.from);
+    const b = findNodeById(link.to);
+    if (!a || !b) return;
+    const line = new ol.geom.LineString([
+      ol.proj.fromLonLat([a.lon, a.lat]),
+      ol.proj.fromLonLat([b.lon, b.lat])
+    ]);
+    const f = new ol.Feature(line);
+    f.setStyle(new ol.style.Style({
+      stroke: new ol.style.Stroke({
+        color: link.active ? "rgba(34,197,94,0.9)" : "rgba(148,163,184,0.4)",
+        width: link.active ? 2.4 : 1.4,
+        lineDash: link.active ? undefined : [5, 6]
+      })
+    }));
+    meshSource.addFeature(f);
+  });
+}
 
 let firePolygonFeature;
 let pulsePhase = 0;
@@ -560,18 +624,67 @@ function resetForecastSlider() {
   sliderLabelEl.innerText = "0";
 }
 
+function stopForecastPlayback() {
+  forecastAutoPlay = false;
+  if (forecastPlaybackTimer) {
+    clearInterval(forecastPlaybackTimer);
+    forecastPlaybackTimer = null;
+  }
+}
+
+function startForecastPlayback() {
+  stopForecastPlayback();
+  if (!forecastGroups.length) return;
+
+  const minHour = Number(sliderEl.min);
+  const maxHour = Number(sliderEl.max);
+  if (!Number.isFinite(minHour) || !Number.isFinite(maxHour) || minHour >= maxHour) {
+    return;
+  }
+
+  forecastAutoPlay = true;
+  if (!Number.isFinite(Number(sliderEl.value))) {
+    renderForecast(minHour);
+  }
+
+  forecastPlaybackTimer = setInterval(() => {
+    if (!forecastAutoPlay || !forecastGroups.length) {
+      stopForecastPlayback();
+      return;
+    }
+    const currentHour = Number(sliderEl.value);
+    if (!Number.isFinite(currentHour)) {
+      renderForecast(minHour);
+      return;
+    }
+    if (currentHour >= maxHour) {
+      stopForecastPlayback();
+      return;
+    }
+    renderForecast(currentHour + 1);
+  }, FORECAST_PLAYBACK_INTERVAL);
+}
+
 function clearForecast() {
+  stopForecastPlayback();
   forecastSource.clear();
   forecastGroups = [];
   resetForecastSlider();
   if (!simInProgress) setSimStatus("Hazır");
+  fireAnalysisData = null;
+  fireAnalysisSource.clear();
+  updateAnalysisPanel(null);
 }
 
 function renderForecast(targetHour) {
   if (!forecastGroups.length) {
+    stopForecastPlayback();
     sliderLabelEl.innerText = "0";
     setSimStatus("Hazır");
     forecastSource.clear();
+    fireAnalysisData = null;
+    fireAnalysisSource.clear();
+    updateAnalysisPanel(null);
     return;
   }
 
@@ -624,12 +737,24 @@ function renderForecast(targetHour) {
     feature.set("zIndex", entry.hour); // Layer ordering
     forecastSource.addFeature(feature);
   });
+
+  const activeEntry = forecastGroups.find((entry) => entry.hour === hour);
+  if (activeEntry && activeEntry.analysis) {
+    fireAnalysisData = activeEntry.analysis;
+    updateAnalysisPanel(activeEntry.analysis);
+    drawFireAnalysis(activeEntry.analysis);
+  } else {
+    fireAnalysisData = null;
+    fireAnalysisSource.clear();
+    updateAnalysisPanel(null);
+  }
 }
 
 function prepareForecast(rawFeatures) {
   clearForecast();
   if (!Array.isArray(rawFeatures) || !rawFeatures.length) {
     setSimStatus("Tahmin verisi yok");
+    suppressAutoAnalysis = false;
     return;
   }
 
@@ -641,11 +766,14 @@ function prepareForecast(rawFeatures) {
       coords: entry.coordinates,
       previousPolygon: entry.previousPolygon || null,
       isRing: entry.isRing || false,
-      stats: entry.stats || {}
+      stats: entry.stats || {},
+      hourCoords: entry.hourCoordinates || entry.coordinates,
+      analysis: entry.fireAnalysis || null
     }));
 
   if (!filtered.length) {
     setSimStatus("Tahmin verisi yok");
+    suppressAutoAnalysis = false;
     return;
   }
 
@@ -656,7 +784,9 @@ function prepareForecast(rawFeatures) {
   sliderEl.step = 1;
   sliderEl.value = sliderEl.min;
   sliderLabelEl.innerText = sliderEl.min;
+  suppressAutoAnalysis = false;
   renderForecast(Number(sliderEl.min));
+  startForecastPlayback();
 }
 
 function computeCentroid(coords) {
@@ -668,6 +798,165 @@ function computeCentroid(coords) {
     sumLon += lon;
   });
   return { lat: sumLat / coords.length, lon: sumLon / coords.length };
+}
+
+function formatLatLon(lat, lon) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  return `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+}
+
+function formatDistanceKm(distanceDegrees) {
+  if (!Number.isFinite(distanceDegrees)) return null;
+  const km = distanceDegrees * DEGREE_TO_KM;
+  return `${km.toFixed(2)} km`;
+}
+
+function updateAnalysisPanel(analysis) {
+  const centerEl = document.getElementById("analysis-center");
+  const radiusEl = document.getElementById("analysis-radius");
+  const searchRadiusEl = document.getElementById("analysis-searchradius");
+  const candidateCountEl = document.getElementById("analysis-candidate-count");
+  const bestCellEl = document.getElementById("analysis-bestcell");
+
+  if (!analysis) {
+    centerEl.innerText = "-";
+    radiusEl.innerText = "-";
+    searchRadiusEl.innerText = "-";
+    candidateCountEl.innerText = "-";
+    bestCellEl.innerText = "-";
+    return;
+  }
+
+  const center = analysis.fireCenter;
+  const formattedCenter = center && Number.isFinite(center.lat) && Number.isFinite(center.lon)
+    ? formatLatLon(center.lat, center.lon)
+    : null;
+  centerEl.innerText = formattedCenter ?? "-";
+
+  const fireRadiusText = formatDistanceKm(analysis.fireRadius);
+  radiusEl.innerText = fireRadiusText ?? "-";
+
+  const searchRadiusText = formatDistanceKm(analysis.searchRadius);
+  searchRadiusEl.innerText = searchRadiusText ?? "-";
+
+  const candidates = Array.isArray(analysis.candidates) ? analysis.candidates.length : 0;
+  const totalCells = Array.isArray(analysis.cells) ? analysis.cells.length : null;
+  candidateCountEl.innerText = totalCells ? `${candidates}/${totalCells}` : String(candidates);
+
+  const best = analysis.bestCell;
+  if (best && (Number.isFinite(best.lat) || Number.isFinite(best.lon))) {
+    const label = `${best.id || best.cell_id || "?"} (${formatLatLon(best.lat ?? best.x, best.lon ?? best.y) ?? "-"})`;
+    const risk = Number.isFinite(best.crew_risk) ? ` • Risk ${best.crew_risk.toFixed(2)}` : "";
+    bestCellEl.innerText = `${label}${risk}`;
+  } else {
+    bestCellEl.innerText = "-";
+  }
+}
+
+function drawFireAnalysis(analysis) {
+  fireAnalysisSource.clear();
+  if (!analysis) return;
+
+  const features = [];
+  const center = analysis.fireCenter;
+  if (center && Number.isFinite(center.lat) && Number.isFinite(center.lon)) {
+    const centerPoint = ol.proj.fromLonLat([center.lon, center.lat]);
+    const searchRadiusMeters = Number.isFinite(analysis.searchRadius)
+      ? analysis.searchRadius * DEGREE_TO_KM * 1000
+      : null;
+    const fireRadiusMeters = Number.isFinite(analysis.fireRadius)
+      ? analysis.fireRadius * DEGREE_TO_KM * 1000
+      : null;
+
+    if (fireRadiusMeters && fireRadiusMeters > 0) {
+      const fireCircle = new geom.Circle(centerPoint, fireRadiusMeters);
+      const fireFeature = new Feature(fireCircle);
+      fireFeature.setStyle(new style.Style({
+        fill: new style.Fill({ color: "rgba(250, 204, 21, 0.15)" }),
+        stroke: new style.Stroke({ color: "rgba(252, 211, 77, 0.85)", width: 2 })
+      }));
+      fireFeature.set("label", `Yangın yarıçapı ≈ ${formatDistanceKm(analysis.fireRadius)}`);
+      features.push(fireFeature);
+    }
+
+    if (searchRadiusMeters && searchRadiusMeters > 0) {
+      const searchCircle = new geom.Circle(centerPoint, searchRadiusMeters);
+      const searchFeature = new Feature(searchCircle);
+      searchFeature.setStyle(new style.Style({
+        fill: new style.Fill({ color: "rgba(59, 130, 246, 0.1)" }),
+        stroke: new style.Stroke({ color: "rgba(37, 99, 235, 0.8)", width: 1.6, lineDash: [6, 6] })
+      }));
+      searchFeature.set("label", `Arama yarıçapı ≈ ${formatDistanceKm(analysis.searchRadius)}`);
+      features.push(searchFeature);
+    }
+
+    const centerFeature = new Feature(new geom.Point(centerPoint));
+    centerFeature.setStyle(new style.Style({
+      image: new style.Circle({
+        radius: 5,
+        fill: new style.Fill({ color: "#facc15" }),
+        stroke: new style.Stroke({ color: "#f59e0b", width: 2 })
+      })
+    }));
+    centerFeature.set("label", `Yangın merkezi\n${formatLatLon(center.lat, center.lon) ?? "-"}`);
+    features.push(centerFeature);
+  }
+
+  const best = analysis.bestCell;
+  const bestId = best ? (best.id || best.cell_id) : null;
+  const candidateList = Array.isArray(analysis.candidates) && analysis.candidates.length
+    ? analysis.candidates
+    : (Array.isArray(analysis.cells) ? analysis.cells : []);
+
+  candidateList.forEach((cell) => {
+    const lat = Number.isFinite(cell.lat) ? cell.lat : cell.x;
+    const lon = Number.isFinite(cell.lon) ? cell.lon : cell.y;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    const id = cell.id || cell.cell_id || "?";
+    const feature = new Feature(new geom.Point(ol.proj.fromLonLat([lon, lat])));
+    const isBest = bestId && id === bestId;
+    feature.setStyle(new style.Style({
+      image: new style.Circle({
+        radius: isBest ? 8 : 6,
+        fill: new style.Fill({ color: isBest ? "rgba(250, 204, 21, 0.9)" : "rgba(34, 197, 94, 0.8)" }),
+        stroke: new style.Stroke({ color: isBest ? "rgba(217, 119, 6, 1)" : "#0f172a", width: isBest ? 2.2 : 1.6 })
+      })
+    }));
+    const spread = Number.isFinite(cell.spread_prob) ? `Yayılım ${cell.spread_prob.toFixed(2)}` : null;
+    const risk = Number.isFinite(cell.crew_risk) ? `Risk ${cell.crew_risk.toFixed(2)}` : null;
+    const value = Number.isFinite(cell.value_at_risk) ? `Değer ${cell.value_at_risk}` : null;
+    const parts = [`${id}`, formatLatLon(lat, lon) ?? null, spread, risk, value].filter(Boolean);
+    feature.set("label", parts.join(" | "));
+    features.push(feature);
+  });
+
+  if (features.length) {
+    fireAnalysisSource.addFeatures(features);
+  }
+}
+
+async function refreshFireAnalysis() {
+  if (!currentFireArea.length) {
+    fireAnalysisData = null;
+    fireAnalysisSource.clear();
+    updateAnalysisPanel(null);
+    return null;
+  }
+
+  try {
+    const res = await fetch(`${API_URL}/api/fire/analysis`);
+    if (!res.ok) throw new Error(`analysis request failed ${res.status}`);
+    const data = await res.json();
+    fireAnalysisData = data;
+    updateAnalysisPanel(data);
+    drawFireAnalysis(data);
+    return data;
+  } catch (err) {
+    console.error(err);
+    fireAnalysisSource.clear();
+    updateAnalysisPanel(null);
+    return null;
+  }
 }
 
 function updateEnvironmentPanel(payload) {
@@ -733,7 +1022,10 @@ async function refreshEnvironment(force = false) {
 function drawFireArea(coords) {
   currentFireArea = Array.isArray(coords) ? coords : [];
   fireSource.clear();
+  fireAnalysisSource.clear();
   if (!currentFireArea.length) {
+    fireAnalysisData = null;
+    updateAnalysisPanel(null);
     return;
   }
   const lonLat = currentFireArea.map(([lat, lon]) => ol.proj.fromLonLat([lon, lat]));
@@ -757,19 +1049,28 @@ function animateFireArea() {
 }
 
 function drawFirefighters(list) {
+  firefightersCache = list;
   ffSource.clear();
   const teamDiv = document.getElementById("team");
   teamDiv.innerHTML = "";
   list.forEach((f) => {
-    const color = f.status === "in-danger" ? "#ef4444" : (f.status === "resting" ? "#9ca3af" : "#22c55e");
+    const baseColor = f.status === "in-danger" ? "#ef4444" : (f.status === "resting" ? "#9ca3af" : "#22c55e");
+    const haloColor = f.status === "in-danger"
+      ? "rgba(239,68,68,0.3)"
+      : (f.status === "resting" ? "rgba(156,163,175,0.25)" : "rgba(34,197,94,0.3)");
     const pt = new geom.Point(ol.proj.fromLonLat([f.lon, f.lat]));
     const ft = new Feature(pt);
     ft.set("label", `${f.name} (${f.status})`);
     ft.setStyle(new style.Style({
       image: new style.Circle({
-        radius: 7,
-        fill: new style.Fill({ color }),
-        stroke: new style.Stroke({ color: "#fff", width: 2 })
+        radius: 11,
+        fill: new style.Fill({ color: haloColor }),
+        stroke: new style.Stroke({ color: baseColor, width: 2 })
+      }),
+      text: new style.Text({
+        text: "👨‍🚒",
+        font: '18px "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif',
+        offsetY: -1
       })
     }));
     ffSource.addFeature(ft);
@@ -778,8 +1079,8 @@ function drawFirefighters(list) {
   });
 }
 
-const droneIcon = "data:image/svg+xml;base64," + btoa(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#38bdf8" stroke="#0ea5e9" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M3 12h3m12 0h3M12 3v3m0 12v3"/></svg>`);
 function drawDrones(list) {
+  dronesCache = list;
   droneSource.clear();
   const div = document.getElementById("drones");
   div.innerHTML = "";
@@ -787,7 +1088,18 @@ function drawDrones(list) {
     const pt = new geom.Point(ol.proj.fromLonLat([d.lon, d.lat]));
     const ft = new Feature(pt);
     ft.set("label", `${d.name} - ${d.status}`);
-    ft.setStyle(new style.Style({ image: new style.Icon({ src: droneIcon, scale: 1.2 }) }));
+    ft.setStyle(new style.Style({
+      image: new style.Circle({
+        radius: 9,
+        fill: new style.Fill({ color: "rgba(59,130,246,0.25)" }),
+        stroke: new style.Stroke({ color: "#38bdf8", width: 2 })
+      }),
+      text: new style.Text({
+        text: "🚁",
+        font: '18px "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif',
+        offsetY: -1
+      })
+    }));
     droneSource.addFeature(ft);
     div.insertAdjacentHTML("beforeend", `<div class="list-item"><span class="dot drone"></span>${d.name}</div>`);
   });
@@ -829,6 +1141,7 @@ async function runSimulation() {
   setSimStatus("Simülasyon başlatılıyor...");
   clearForecast();
   stopPeriodicNotifications();
+  suppressAutoAnalysis = true;
 
   const { lat, lon } = computeCentroid(currentFireArea);
   // Generate a different alert location nearby
@@ -870,6 +1183,7 @@ async function runSimulation() {
     );
   } finally {
     simInProgress = false;
+    suppressAutoAnalysis = false;
   }
 }
 
@@ -883,17 +1197,24 @@ async function loadAll() {
   drawFireArea(fa);
   drawDrones(dr);
   await refreshEnvironment(true);
+  await refreshFireAnalysis();
 }
-
+socket.on("mesh:update", drawMeshLinks);
 socket.on("firefighters:init", drawFirefighters);
 socket.on("firefighters:update", drawFirefighters);
 socket.on("firearea:init", (coords) => {
   drawFireArea(coords);
   refreshEnvironment(true);
+  if (!suppressAutoAnalysis) {
+    refreshFireAnalysis();
+  }
 });
 socket.on("firearea:update", (coords) => {
   drawFireArea(coords);
   refreshEnvironment(true);
+  if (!suppressAutoAnalysis) {
+    refreshFireAnalysis();
+  }
 });
 socket.on("drones:init", drawDrones);
 socket.on("drones:update", drawDrones);

@@ -1,6 +1,7 @@
 const { fetchWeather } = require("./weather");
 const { buildElevationGrid } = require("./slope");
 const { computeFWI } = require("./fwi");
+const { analyzeFirePolygon } = require("./fireAnalysis");
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
@@ -25,6 +26,67 @@ function normalize(vec) {
 
 function sigmoid(x) {
   return 1 / (1 + Math.exp(-x));
+}
+
+function formatFireAnalysisForClient(analysis) {
+  if (!analysis) {
+    return null;
+  }
+
+  const [centerLat, centerLon] = Array.isArray(analysis.center)
+    ? [analysis.center[0], analysis.center[1]]
+    : [null, null];
+
+  const mapCell = (cell) => {
+    if (!cell) return null;
+    return {
+      id: cell.cell_id,
+      lat: cell.x,
+      lon: cell.y,
+      fire_power: cell.fire_power,
+      spread_prob: cell.spread_prob,
+      area: cell.area,
+      value_at_risk: cell.value_at_risk,
+      crew_risk: cell.crew_risk,
+      time_to_impact: cell.time_to_impact,
+      dist_to_fire_center: cell.dist_to_fire_center,
+      fire_speed: cell.fire_speed,
+      wind_speed: cell.wind_speed,
+      wind_dir: cell.wind_dir,
+      temperature: cell.temperature,
+      humidity: cell.humidity,
+      fuel_moisture: cell.fuel_moisture,
+      slope: cell.slope,
+      danger_multiplier: cell.danger_multiplier,
+      score: cell.score
+    };
+  };
+
+  const cells = Array.isArray(analysis.cells)
+    ? analysis.cells.map(mapCell).filter(Boolean)
+    : [];
+
+  const candidateIds = new Set(
+    Array.isArray(analysis.candidates)
+      ? analysis.candidates.map((cell) => cell.cell_id)
+      : []
+  );
+
+  const candidates = cells.filter((cell) => candidateIds.has(cell.id));
+  const bestCell = mapCell(analysis.bestCell);
+
+  return {
+    firePolygon: Array.isArray(analysis.coords) ? analysis.coords.slice() : [],
+    fireCenter: {
+      lat: centerLat,
+      lon: centerLon
+    },
+    fireRadius: analysis.radius,
+    searchRadius: analysis.searchRadius,
+    cells,
+    candidates,
+    bestCell
+  };
 }
 
 // Rothermel Fire Spread Model Implementation
@@ -365,6 +427,7 @@ function buildForecastPolygons(snapshots, { gridSize, lat, lon, cellSize, basePo
     forecast.push({
       hour: 0,
       coordinates: baseCoords,
+      hourCoordinates: baseCoords,
       stats: { probability: 1, cells: 0, time: new Date(startTime).toISOString() },
       isRing: false
     });
@@ -411,6 +474,17 @@ function buildForecastPolygons(snapshots, { gridSize, lat, lon, cellSize, basePo
       polygonCoords = [[lon, lat], [lon + cellSize, lat], [lon, lat + cellSize], [lon, lat]];
     }
 
+    const hourHullPoints = convexHull(currentHourPoints);
+    let hourPolygonCoords;
+    if (hourHullPoints.length >= 3) {
+      hourPolygonCoords = hourHullPoints.map((p) => [p.lon, p.lat]);
+      if (hourPolygonCoords.length) {
+        hourPolygonCoords.push(hourPolygonCoords[0]);
+      }
+    } else {
+      hourPolygonCoords = polygonCoords.slice();
+    }
+
     const probabilityAvg = snap.cells.length
       ? snap.cells.reduce((acc, cell) => acc + (cell.probability ?? 0), 0) / snap.cells.length
       : 0;
@@ -422,6 +496,7 @@ function buildForecastPolygons(snapshots, { gridSize, lat, lon, cellSize, basePo
       hour: snap.hour,
       coordinates: polygonCoords,
       previousPolygon: previousHourPolygon ? previousHourPolygon.map(p => [p[0], p[1]]) : null,
+      hourCoordinates: hourPolygonCoords,
       stats: {
         probability: Number(probabilityAvg.toFixed(2)),
         cells: snap.cells.length,
@@ -592,6 +667,36 @@ async function runFireSimulation(options = {}) {
   });
 
   const geo = buildForecastPolygons(simulation.snapshots, { gridSize, lat, lon, cellSize: effectiveCellSize, basePolygon });
+  const forecastWithAnalysis = geo.forecast.map((entry) => {
+    const coords = Array.isArray(entry?.hourCoordinates)
+      ? entry.hourCoordinates
+      : (Array.isArray(entry?.coordinates) ? entry.coordinates : []);
+    const polygon = coords
+      .map((pair) => {
+        if (!Array.isArray(pair) || pair.length < 2) return null;
+        const lonValue = Number(pair[0]);
+        const latValue = Number(pair[1]);
+        if (!Number.isFinite(latValue) || !Number.isFinite(lonValue)) return null;
+        return [latValue, lonValue];
+      })
+      .filter(Boolean);
+
+    if (
+      polygon.length >= 3 &&
+      polygon[0][0] === polygon[polygon.length - 1][0] &&
+      polygon[0][1] === polygon[polygon.length - 1][1]
+    ) {
+      polygon.pop();
+    }
+
+    const fireAnalysisRaw = analyzeFirePolygon(polygon);
+    const fireAnalysis = formatFireAnalysisForClient(fireAnalysisRaw);
+
+    return {
+      ...entry,
+      fireAnalysis
+    };
+  });
   const footprintHull = convexHull(geo.burnedCentroids);
   const footprint = footprintHull.length > 2
     ? [...footprintHull, footprintHull[0]].map((p) => [p.lat, p.lon])
@@ -619,8 +724,8 @@ async function runFireSimulation(options = {}) {
       directionFrom: Number((w.directionFrom ?? 0).toFixed(1)),
       directionTo: Number((w.directionTo ?? 0).toFixed(1))
     })),
-    forecast: geo.forecast,
-    features: geo.forecast,
+    forecast: forecastWithAnalysis,
+    features: forecastWithAnalysis,
     footprint
   };
 }
