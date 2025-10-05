@@ -1,6 +1,6 @@
-# FireMap Dashboard
+# FireMesh Dashboard
 
-FireMap is an integrated situational-awareness platform created for the NASA Space Apps Challenge to keep firefighters informed about one another during fast-evolving forest fires. The dashboard fuses live crew telemetry, peer-to-peer connectivity insights, and environmental intelligence so that every responder can understand where teammates are, how the fire is spreading, and which zones need attention.
+FireMesh is an integrated situational-awareness platform created for the NASA Space Apps Challenge to keep firefighters informed about one another during fast-evolving forest fires. The dashboard fuses live crew telemetry, peer-to-peer connectivity insights, and environmental intelligence so that every responder can understand where teammates are, how the fire is spreading, and which zones need attention.
 
 ## Objectives
 - Maintain a single shared map of firefighter and drone locations, ensuring teams stay aware of one another's movements and proximity to danger.
@@ -65,7 +65,7 @@ FireMap is an integrated situational-awareness platform created for the NASA Spa
 WebSocket channels (`firefighters:update`, `drones:update`, `firearea:update`, `fire:forecast`, `mesh:update`) keep the crew-awareness layers synchronized across all connected clients.
 
 ## NASA Space Apps Alignment
-- **Challenge fit:** Directly addresses "Wildfire Connections" by prioritizing firefighter-to-firefighter awareness and resilience of field communications.
+- **Challenge fit:** Directly addresses "Create Your Own Challenge" by prioritizing firefighter-to-firefighter awareness and resilience of field communications.
 - **Value proposition:**
   - Creates a single truth source for crew positions, connectivity, and fire behavior.
   - Surfaces at-risk teammates through targeted alerts, improving mutual awareness and rapid support.
@@ -78,4 +78,4 @@ WebSocket channels (`firefighters:update`, `drones:update`, `firearea:update`, `
 - Expand mesh analytics with bandwidth/latency estimates and suggested relay drone placements.
 
 ## Contributing
-Teams aiming to extend FireMap after NASA Space Apps can open issues or submit pull requests. Please include a short summary of the change and any validation steps you carried out to keep the crew-awareness workflow reliable.
+Teams aiming to extend FireMesh after NASA Space Apps can open issues or submit pull requests. Please include a short summary of the change and any validation steps you carried out to keep the crew-awareness workflow reliable.
